@@ -1,0 +1,53 @@
+{
+	"name": "wireweaver",
+	"description": "A lightweight TypeScript Dependency Injection Library",
+	"productName": "WireWeaver",
+	"version": "0.1.0",
+	"type": "module",
+	"main": "./dist/index.cjs",
+	"module": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js",
+			"require": "./dist/index.cjs"
+		},
+		"./vite-plugin": {
+			"types": "./dist/vite-plugin.d.ts",
+			"import": "./dist/vite-plugin.js",
+			"require": "./dist/vite-plugin.cjs"
+		}
+	},
+	"files": [
+		"dist"
+	],
+	"scripts": {
+		"build": "tsup",
+		"build:dev": "tsc -p tsconfig.build.json",
+		"test": "vitest run"
+	},
+	"keywords": [],
+	"author": "",
+	"license": "ISC",
+	"dependencies": {
+		"reflect-metadata": "^0.2.2"
+	},
+	"peerDependencies": {
+		"typescript": ">=5.0.0"
+	},
+	"peerDependenciesMeta": {
+		"typescript": {
+			"optional": true
+		}
+	},
+	"devDependencies": {
+		"@types/node": "^25.8.0",
+		"esbuild": "^0.28.1",
+		"tsup": "^8.5.1",
+		"tsx": "^4.22.1",
+		"typescript": "^6.0.3",
+		"vite": "^8.0.13",
+		"vitest": "^4.1.6"
+	}
+}

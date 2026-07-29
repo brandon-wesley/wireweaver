@@ -1,0 +1,15 @@
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"experimentalDecorators": true,
+		"emitDecoratorMetadata": true,
+		"strict": true,
+		"ignoreDeprecations": "6.0",
+		"outDir": "dist"
+	},
+	"include": [
+		"src"
+	]
+}
