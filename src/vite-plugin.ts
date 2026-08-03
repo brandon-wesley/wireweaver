@@ -531,7 +531,10 @@ function discoverInterfaceImplementations(root: string, extraScanDirs: string[] 
 
 	for (const dir of extraScanDirs) {
 		const packageRoot = findPackageRoot(dir);
-		scanSourceFilesForImplementations(dir, implementations, allClassHeritage, beanReturnTypes, true, packageRoot);
+		// Published packages ship declaration files with the `@Component()`/`@Service()`
+		// decorators erased, so we recover the decorated class names from the compiled JS.
+		const componentNames = collectComponentClassNames(dir);
+		scanSourceFilesForImplementations(dir, implementations, allClassHeritage, beanReturnTypes, true, packageRoot, componentNames);
 	}
 
 	// Phase 2: for classes provided exclusively via @Bean() (no @Component()),
@@ -559,6 +562,7 @@ function scanSourceFilesForImplementations(
 	beanReturnTypes: Set<string>,
 	allowNodeModules: boolean,
 	packageRoot?: string,
+	componentNames: Set<string> = new Set(),
 ): void {
 	for (const sourceFile of getScanSourceFiles(root, allowNodeModules)) {
 		ts.forEachChild(sourceFile, (node) => {
@@ -582,7 +586,9 @@ function scanSourceFilesForImplementations(
 						}
 
 						// Immediately add to implementations if the class is @Component()/@Service() decorated.
-						if (!hasServiceDecorator(node)) continue;
+						// Decorators are erased in shipped .d.ts files, so also accept class names
+						// recovered from the package's compiled JS (componentNames).
+						if (!hasServiceDecorator(node) && !componentNames.has(node.name.text)) continue;
 						const existing = implementations.get(interfaceName) ?? [];
 						if (existing.some((impl) => impl.className === node.name!.text && normalizeFilePath(impl.filePath) === normalizeFilePath(sourceFile.fileName))) {
 							continue;
@@ -721,15 +727,21 @@ function buildImportInsertions(
 
 		const existing = findImportByModule(sourceFile, importPath);
 		if (existing && existing.importClause?.namedBindings && ts.isNamedImports(existing.importClause.namedBindings)) {
-			const existingNames = new Set(existing.importClause.namedBindings.elements.map((element) => element.name.text));
+			const namedImports = existing.importClause.namedBindings;
+			// Match against local binding names so aliased imports (e.g. `User as IUser`) are respected.
+			const existingNames = new Set(namedImports.elements.map((element) => element.name.text));
 			const missing = unresolved.filter((name) => !existingNames.has(name));
 			if (missing.length === 0) continue;
 
-			const namedImports = existing.importClause.namedBindings;
+			// Insert only the missing names before the closing brace, leaving existing
+			// elements untouched so per-element `type` modifiers and `as` aliases survive.
+			const hasElements = namedImports.elements.length > 0;
+			const insertionPoint = namedImports.getEnd() - 1;
+			const prefix = hasElements ? ', ' : '';
 			replacements.push({
-				start: namedImports.getStart(sourceFile) + 1,
-				end: namedImports.getEnd() - 1,
-				text: `${[...existingNames, ...missing].sort().join(', ')}`,
+				start: insertionPoint,
+				end: insertionPoint,
+				text: `${prefix}${missing.sort().join(', ')}`,
 			});
 			continue;
 		}
@@ -868,6 +880,71 @@ function resolveExtraScanDirs(root: string, extraScanDirs?: string[]): string[] 
  * Walks up from `startDir` until it finds a directory containing a `package.json`.
  * Returns that directory, or undefined if none is found.
  */
+/**
+ * Scans compiled JavaScript output under `dir` for classes decorated with
+ * `@Component()`/`@Service()`. Declaration files (`.d.ts`) erase decorators, so the
+ * decorator information only survives in the emitted `.js`/`.cjs`. Both the modern
+ * stage-3 form (`_Foo_decorators = [Component()]`) and the legacy TS form
+ * (`__decorate([Component()], Foo)`) are recognized.
+ *
+ * Returns the set of decorated class names. `node_modules` nested inside the package
+ * are skipped.
+ */
+function collectComponentClassNames(dir: string): Set<string> {
+	const names = new Set<string>();
+	// Stage-3 (esbuild/tsup): `_ClassName_decorators = [ ... Component() ... ];`
+	const stage3 = /_([A-Za-z_$][\w$]*)_decorators\s*=\s*\[([^\]]*)\]/g;
+	// Legacy TS: `SomeClass = __decorate([ ... Component() ... ], SomeClass);`
+	const legacy = /__decorate\(\s*\[([^\]]*?)\]\s*,\s*([A-Za-z_$][\w$]*)/g;
+
+	function containsComponentDecorator(decoratorList: string): boolean {
+		return /\b(Component|Service)\s*\(/.test(decoratorList);
+	}
+
+	function walk(current: string): void {
+		let entries: string[];
+		try {
+			entries = readdirSync(current);
+		} catch {
+			return;
+		}
+
+		for (const name of entries) {
+			const fullPath = joinPath(current, name);
+			let isDir = false;
+			try {
+				isDir = statSync(fullPath).isDirectory();
+			} catch {
+				continue;
+			}
+
+			if (isDir) {
+				if (name === 'node_modules') continue;
+				walk(fullPath);
+				continue;
+			}
+			if (!/\.(js|cjs|mjs)$/.test(name)) continue;
+
+			let content: string;
+			try {
+				content = readFileSync(fullPath, 'utf-8');
+			} catch {
+				continue;
+			}
+
+			for (const match of content.matchAll(stage3)) {
+				if (containsComponentDecorator(match[2])) names.add(match[1]);
+			}
+			for (const match of content.matchAll(legacy)) {
+				if (containsComponentDecorator(match[1])) names.add(match[2]);
+			}
+		}
+	}
+
+	walk(dir);
+	return names;
+}
+
 function findPackageRoot(startDir: string): string | undefined {
 	let current = startDir;
 	while (true) {
