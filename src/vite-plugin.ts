@@ -3,7 +3,7 @@ import type { Plugin as EsbuildPlugin } from 'esbuild';
 import ts from 'typescript';
 import { readFile } from 'node:fs/promises';
 import { isAbsolute, resolve as resolvePath, join as joinPath, dirname } from 'node:path';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 
 interface InterfaceImplementation {
 	className: string;
@@ -372,20 +372,108 @@ function collectBeanRegistrationsFromDir(
 	result: BeanRegistrationMap,
 	allowNodeModules: boolean,
 ): void {
-	const tsconfigPath = ts.findConfigFile(root, ts.sys.fileExists, 'tsconfig.json');
-	if (!tsconfigPath) return;
-
-	const configFile = ts.readConfigFile(tsconfigPath, ts.sys.readFile);
-	if (configFile.error) return;
-
-	const parsedConfig = ts.parseJsonConfigFileContent(configFile.config, ts.sys, getDirName(tsconfigPath));
-	const program = ts.createProgram({ rootNames: parsedConfig.fileNames, options: parsedConfig.options });
-
-	for (const sourceFile of program.getSourceFiles()) {
-		if (sourceFile.isDeclarationFile) continue;
-		if (!allowNodeModules && sourceFile.fileName.includes('/node_modules/')) continue;
+	for (const sourceFile of getScanSourceFiles(root, allowNodeModules)) {
 		collectBeanRegistrationsFromFile(sourceFile, sourceFile.fileName, implementations, result);
 	}
+}
+
+/**
+ * Returns the source files to scan for a given directory.
+ *
+ * For the project's own root (`allowNodeModules === false`) this resolves the nearest
+ * tsconfig.json and returns its non-declaration program files, as before.
+ *
+ * For an extra scan directory (`allowNodeModules === true`) — typically a workspace
+ * package — the search is different: published packages ship only compiled `dist`
+ * output (`.d.ts` + `.js`) with no `tsconfig.json` and no `.ts` sources. In that case
+ * `ts.findConfigFile` would walk *up* past the package and pick up the consumer app's
+ * tsconfig, scanning the wrong files. To avoid that we:
+ *   1. Only accept a tsconfig found at or below the scan directory itself.
+ *   2. Otherwise fall back to parsing the package's `.ts`/`.tsx`/`.d.ts` files directly,
+ *      including declaration files (which carry the `implements` heritage the plugin
+ *      needs to discover interface implementations).
+ */
+function getScanSourceFiles(root: string, allowNodeModules: boolean): ts.SourceFile[] {
+	const tsconfigPath = allowNodeModules
+		? findTsconfigWithin(root)
+		: ts.findConfigFile(root, ts.sys.fileExists, 'tsconfig.json');
+
+	if (tsconfigPath) {
+		const configFile = ts.readConfigFile(tsconfigPath, ts.sys.readFile);
+		if (configFile.error) return [];
+
+		const parsedConfig = ts.parseJsonConfigFileContent(configFile.config, ts.sys, getDirName(tsconfigPath));
+		const program = ts.createProgram({ rootNames: parsedConfig.fileNames, options: parsedConfig.options });
+
+		const files: ts.SourceFile[] = [];
+		for (const sourceFile of program.getSourceFiles()) {
+			// For packages we keep declaration files — they hold the `implements` heritage.
+			if (!allowNodeModules && sourceFile.isDeclarationFile) continue;
+			if (!allowNodeModules && sourceFile.fileName.includes('/node_modules/')) continue;
+			files.push(sourceFile);
+		}
+		return files;
+	}
+
+	// No usable tsconfig — parse the directory's TypeScript/declaration files directly.
+	if (!allowNodeModules) return [];
+	return parseSourceFilesInDir(root);
+}
+
+/**
+ * Finds a tsconfig.json at or below `dir`, without walking up into parent directories.
+ * Returns undefined if the directory does not contain one at its top level.
+ */
+function findTsconfigWithin(dir: string): string | undefined {
+	const candidate = joinPath(dir, 'tsconfig.json');
+	return existsSync(candidate) ? candidate : undefined;
+}
+
+/**
+ * Recursively reads `.ts`/`.tsx`/`.d.ts` files under `dir` and parses each into a
+ * standalone SourceFile. Used as a fallback for published packages that ship
+ * declaration files but no tsconfig. `node_modules` nested inside the package are skipped.
+ */
+function parseSourceFilesInDir(dir: string): ts.SourceFile[] {
+	const sourceFiles: ts.SourceFile[] = [];
+
+	function walk(current: string): void {
+		let names: string[];
+		try {
+			names = readdirSync(current);
+		} catch {
+			return;
+		}
+
+		for (const name of names) {
+			const fullPath = joinPath(current, name);
+			let isDir = false;
+			try {
+				isDir = statSync(fullPath).isDirectory();
+			} catch {
+				continue;
+			}
+
+			if (isDir) {
+				if (name === 'node_modules') continue;
+				walk(fullPath);
+				continue;
+			}
+			if (!/\.(ts|tsx)$/.test(name)) continue;
+
+			try {
+				const content = readFileSync(fullPath, 'utf-8');
+				sourceFiles.push(
+					ts.createSourceFile(fullPath, content, ts.ScriptTarget.Latest, /* setParentNodes */ true, ts.ScriptKind.TS),
+				);
+			} catch {
+				// ignore unreadable files
+			}
+		}
+	}
+
+	walk(dir);
+	return sourceFiles;
 }
 
 function collectBeanRegistrationsFromFile(
@@ -472,27 +560,7 @@ function scanSourceFilesForImplementations(
 	allowNodeModules: boolean,
 	packageRoot?: string,
 ): void {
-	const tsconfigPath = ts.findConfigFile(root, ts.sys.fileExists, 'tsconfig.json');
-	if (!tsconfigPath) return;
-
-	const configFile = ts.readConfigFile(tsconfigPath, ts.sys.readFile);
-	if (configFile.error) return;
-
-	const parsedConfig = ts.parseJsonConfigFileContent(
-		configFile.config,
-		ts.sys,
-		getDirName(tsconfigPath),
-	);
-
-	const program = ts.createProgram({
-		rootNames: parsedConfig.fileNames,
-		options: parsedConfig.options,
-	});
-
-	for (const sourceFile of program.getSourceFiles()) {
-		if (sourceFile.isDeclarationFile) continue;
-		if (!allowNodeModules && sourceFile.fileName.includes('/node_modules/')) continue;
-
+	for (const sourceFile of getScanSourceFiles(root, allowNodeModules)) {
 		ts.forEachChild(sourceFile, (node) => {
 			if (ts.isClassDeclaration(node) && node.name) {
 				const importSpecifier = packageRoot
